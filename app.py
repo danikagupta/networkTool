@@ -3,11 +3,11 @@ import socket
 import subprocess
 import requests
 import time
-from datetime import datetime
-from typing import List, Tuple, Dict
-import concurrent.futures
-import threading
+from datetime import datetime, timedelta
+from typing import Tuple, Dict, Any
+from urllib.parse import urlparse
 
+# Diagnostic Functions
 
 def get_dns_info(server: str) -> Tuple[str, Dict[str, str]]:
     """
@@ -29,7 +29,6 @@ def get_dns_info(server: str) -> Tuple[str, Dict[str, str]]:
         ip_address = "N/A"
     return ip_address, dns_info
 
-
 def ping_server(ip: str) -> str:
     """
     Pings the given IP address.
@@ -41,15 +40,18 @@ def ping_server(ip: str) -> str:
         str: The ping result or an error message.
     """
     try:
-        # '-c 4' sends 4 packets; '-n' numeric output
-        result = subprocess.run(['ping', '-c', '4', '-n', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Modify the ping command based on the operating system
+        import platform
+        param = '-n' if platform.system().lower() == 'windows' else '-c'
+        result = subprocess.run(['ping', param, '4', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
         if result.returncode == 0:
             return result.stdout
         else:
             return result.stderr
+    except subprocess.TimeoutExpired:
+        return "Ping command timed out."
     except Exception as e:
         return str(e)
-
 
 def traceroute_server(ip: str) -> str:
     """
@@ -62,69 +64,46 @@ def traceroute_server(ip: str) -> str:
         str: The traceroute result or an error message.
     """
     try:
-        result = subprocess.run(['traceroute', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        import platform
+        command = ['tracert', ip] if platform.system().lower() == 'windows' else ['traceroute', ip]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
         if result.returncode == 0:
             return result.stdout
         else:
             return result.stderr
+    except subprocess.TimeoutExpired:
+        return "Traceroute command timed out."
     except Exception as e:
         return str(e)
 
-
-def perform_https_request(url: str) -> Dict[str, any]:
+def perform_https_request(url: str) -> Dict[str, Any]:
     """
-    Makes an HTTPS GET request to the given URL and records each step's time.
+    Performs an HTTPS GET request to the specified URL and records timings.
 
     Args:
-        url (str): The base URL to request.
+        url (str): The URL to send the GET request to.
 
     Returns:
-        Dict containing response details and timings.
+        Dict containing the HTTPS response details and timings.
     """
-    response_details = {}
-    timings = {}
+    result = {}
     try:
         start_time = time.time()
-        session = requests.Session()
-        # Resolve TCP connection
-        tcp_start = time.time()
-        response = session.get(url, stream=True, timeout=10)
-        tcp_end = time.time()
-        timings['TCP Connection'] = tcp_end - tcp_start
+        response = requests.get(url, timeout=120)
+        end_time = time.time()
+        result['Status Code'] = response.status_code
+        result['Headers'] = dict(response.headers)
+        result['Body'] = response.text[:200]  # First 200 characters
+        result['Timings'] = {
+            'DNS Lookup': response.elapsed.total_seconds(),
+            'Total Time': end_time - start_time
+        }
+        result['Bytes Downloaded'] = len(response.content)
+    except requests.RequestException as e:
+        result['Error'] = str(e)
+    return result
 
-        # SSL Handshake
-        ssl_start = tcp_end
-        # requests handles SSL handshake internally; approximating time
-        ssl_end = time.time()
-        timings['SSL Handshake'] = ssl_end - ssl_start
-
-        # Response Headers
-        headers_start = ssl_end
-        headers = response.headers
-        headers_end = time.time()
-        timings['Response Headers'] = headers_end - headers_start
-
-        # Full Response
-        body_start = headers_end
-        body = response.text[:200]  # First 200 characters
-        body_end = time.time()
-        timings['Full Response'] = body_end - body_start
-
-        total_time = body_end - start_time
-
-        response_details['Status Code'] = response.status_code
-        response_details['Headers'] = dict(response.headers)
-        response_details['Body'] = body
-        response_details['Timings'] = timings
-        response_details['Total Time'] = total_time
-
-    except requests.exceptions.RequestException as e:
-        response_details['Error'] = str(e)
-
-    return response_details
-
-
-def diagnose_issues(dns_info: Tuple[str, Dict[str, str]], ping_result: str, traceroute_result: str, https_result: Dict[str, any]) -> str:
+def diagnose_issues(dns_info: Tuple[str, Dict[str, str]], ping_result: str, traceroute_result: str, https_result: Dict[str, Any]) -> str:
     """
     Diagnoses issues based on the results of DNS, Ping, Traceroute, and HTTPS checks.
 
@@ -132,7 +111,7 @@ def diagnose_issues(dns_info: Tuple[str, Dict[str, str]], ping_result: str, trac
         dns_info (Tuple[str, Dict[str, str]]): DNS information.
         ping_result (str): Result of the ping test.
         traceroute_result (str): Result of the traceroute test.
-        https_result (Dict[str, any]): Result of the HTTPS request.
+        https_result (Dict[str, Any]): Result of the HTTPS request.
 
     Returns:
         str: Diagnosis and suggested fixes.
@@ -145,19 +124,21 @@ def diagnose_issues(dns_info: Tuple[str, Dict[str, str]], ping_result: str, trac
     else:
         diagnosis += f"✅ DNS resolution succeeded. IP Address: {ip}\n"
 
-    if "Request timeout" in ping_result or "unreachable" in ping_result.lower():
-        diagnosis += "⚠️ Ping test failed. The server might be down or ICMP requests are blocked.\n"
-    else:
-        diagnosis += "✅ Ping test succeeded. Server is reachable.\n"
+    if ping_result:
+        if "Request timeout" in ping_result or "unreachable" in ping_result.lower():
+            diagnosis += "⚠️ Ping test failed. The server might be down or ICMP requests are blocked.\n"
+        else:
+            diagnosis += "✅ Ping test succeeded. Server is reachable.\n"
 
-    if "over" in traceroute_result.lower() or "unreachable" in traceroute_result.lower():
-        diagnosis += "⚠️ Traceroute encountered issues. There might be network routing problems.\n"
-    else:
-        diagnosis += "✅ Traceroute succeeded. Network routing appears normal.\n"
+    if traceroute_result:
+        if "over" in traceroute_result.lower() or "unreachable" in traceroute_result.lower():
+            diagnosis += "⚠️ Traceroute encountered issues. There might be network routing problems.\n"
+        else:
+            diagnosis += "✅ Traceroute succeeded. Network routing appears normal.\n"
 
     if 'Error' in https_result:
         diagnosis += f"🛑 HTTPS request failed: {https_result['Error']}\n"
-    else:
+    elif 'Status Code' in https_result:
         diagnosis += f"✅ HTTPS request succeeded with status code {https_result['Status Code']}.\n"
 
     # Suggested fixes based on diagnosis
@@ -172,135 +153,197 @@ def diagnose_issues(dns_info: Tuple[str, Dict[str, str]], ping_result: str, trac
 
     return diagnosis
 
+# Streamlit Application
 
 def main():
+    st.set_page_config(page_title="🛠️ Networking Diagnostic Tool", layout="wide")
     st.title("🛠️ Networking Diagnostic Tool")
 
-    st.sidebar.header("Server Selection")
-    predefined_servers = ["google.com", "github.com", "stackoverflow.com"]
-    server_choice = st.sidebar.selectbox("Select a server from the list:", ["--Select--"] + predefined_servers)
-    custom_server = st.sidebar.text_input("Or enter your own server name:", "")
+    # Initialize session state
+    if 'diagnostics_running' not in st.session_state:
+        st.session_state.diagnostics_running = False
+    if 'start_time' not in st.session_state:
+        st.session_state.start_time = None
+    if 'elapsed_time' not in st.session_state:
+        st.session_state.elapsed_time = "00:00:00"
+    if 'timeout_reached' not in st.session_state:
+        st.session_state.timeout_reached = False
 
-    # Placeholders for sidebar diagnostics
-    sidebar_diagnosis = st.sidebar.empty()
-    dns_placeholder = st.sidebar.empty()
-    ping_placeholder = st.sidebar.empty()
-    traceroute_placeholder = st.sidebar.empty()
-    https_placeholder = st.sidebar.empty()
-    final_diagnosis_placeholder = st.sidebar.empty()
+    # Layout: Single column
+    st.header("🔧 Server Selection & Diagnostics")
+    st.markdown("---")
 
-    if st.sidebar.button("Run Diagnostics"):
+    # Server Selection and Diagnostic Options
+    server_choice = st.selectbox("Select a server from the list:", ["--Select--", "google.com", "github.com", "stackoverflow.com"], key="server_choice")
+    custom_input = st.text_input("Or enter a URL (e.g., https://example.com):", key="custom_input")
+
+    st.markdown("---")
+    st.header("🧰 Select Diagnostics to Run")
+    run_dns = st.checkbox("🔍 DNS Mapping", value=True, key="run_dns")  # DNS is essential
+    run_ping = st.checkbox("📡 Ping Test", value=False, key="run_ping")
+    run_traceroute = st.checkbox("🗺️ Traceroute", value=False, key="run_traceroute")
+    run_https = st.checkbox("🔒 HTTPS GET Request", value=True, key="run_https")  # HTTPS is essential
+
+    st.markdown("---")
+    run_button = st.button("🚀 Run Diagnostics", disabled=st.session_state.diagnostics_running)
+
+    # Display Server Name
+    server_display = st.empty()
+    if run_button and not st.session_state.diagnostics_running:
+        # Determine server and URL
         if server_choice != "--Select--":
             server = server_choice
-        elif custom_server:
-            server = custom_server
+            url = f"https://{server}"
+        elif custom_input.strip():
+            parsed_url = urlparse(custom_input.strip())
+            if parsed_url.scheme and parsed_url.netloc:
+                server = parsed_url.netloc
+                url = custom_input.strip()
+            else:
+                server = custom_input.strip()
+                url = custom_input.strip()
         else:
-            st.error("Please select a predefined server or enter a custom server name.")
-            return
+            st.error("❌ Please select a predefined server or enter a valid URL.")
+            st.stop()
 
-        st.header(f"Diagnostics for: {server}")
+        # Validate that at least one diagnostic is selected
+        if not any([run_dns, run_ping, run_traceroute, run_https]):
+            st.error("❌ Please select at least one diagnostic test to run.")
+            st.stop()
 
-        # Initialize placeholders in sidebar
-        dns_placeholder.text("🔍 Performing DNS Lookup...")
-        ping_placeholder.text("📡 Pinging the server...")
-        traceroute_placeholder.text("🗺️ Running Traceroute...")
-        https_placeholder.text("🔒 Making HTTPS GET request...")
-        final_diagnosis_placeholder.text("🩺 Awaiting diagnosis...")
+        # Initialize diagnostics state
+        st.session_state.diagnostics_running = True
+        st.session_state.start_time = datetime.now()
+        st.session_state.elapsed_time = "00:00:00"
+        st.session_state.timeout_reached = False
 
-        # Shared variables to store results
-        results = {}
-        lock = threading.Lock()
+        # Display Server Name
+        server_display.markdown(f"## 🖥️ Selected Server: **{server}**")
+        st.markdown("---")
 
-        # Function to update sidebar as each test completes
-        def update_sidebar():
-            diagnosis = diagnose_issues(
-                results.get("dns_info", ("N/A", {})),
-                results.get("ping_result", ""),
-                results.get("traceroute_result", ""),
-                results.get("https_result", {})
-            )
-            final_diagnosis_placeholder.text("🩺 Diagnosis:")
-            # Display the diagnosis in the sidebar
-            final_diagnosis_placeholder.markdown(diagnosis)
+        # Placeholders for Diagnostic Results
+        timer_placeholder = st.empty()
+        dns_placeholder = st.empty()
+        ping_placeholder = st.empty()
+        traceroute_placeholder = st.empty()
+        https_placeholder = st.empty()
+        diagnosis_placeholder = st.empty()
 
-        # Start parallel diagnostics
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_dns = executor.submit(get_dns_info, server)
-            future_ping = None
-            future_traceroute = None
-            future_https = None
+        # Timer Function
+        def run_timer():
+            while st.session_state.diagnostics_running and not st.session_state.timeout_reached:
+                current_time = datetime.now()
+                elapsed = current_time - st.session_state.start_time
+                if elapsed >= timedelta(minutes=3):
+                    st.session_state.timeout_reached = True
+                    st.session_state.diagnostics_running = False
+                    st.error("⏰ Diagnostics timed out after 3 minutes.")
+                    st.stop()
+                else:
+                    st.session_state.elapsed_time = str(elapsed).split(".")[0]  # Remove microseconds
+                timer_placeholder.markdown(f"### ⏱️ Elapsed Time: {st.session_state.elapsed_time}")
+                time.sleep(1)
 
-            # Collect DNS result first to get IP for ping and traceroute
-            dns_result = future_dns.result()
-            with lock:
+        # Start Timer
+        import threading
+        timer_thread = threading.Thread(target=run_timer, daemon=True)
+        timer_thread.start()
+
+        # Run Diagnostics Synchronously
+        try:
+            results = {}
+
+            # DNS Mapping
+            if run_dns:
+                dns_placeholder.markdown("**🔍 DNS Mapping:** Running...")
+                dns_result = get_dns_info(server)
                 results["dns_info"] = dns_result
-            ip, dns_info = dns_result
+                ip, dns_info = dns_result
 
-            # Update DNS information in sidebar
-            if ip != "N/A":
-                with dns_placeholder.expander(f"IP Address: {ip}"):
-                    for k, v in dns_info.items():
-                        if k != "IP Address":
-                            dns_placeholder.text(f"{k}: {v}")
+                if ip != "N/A":
+                    dns_placeholder.markdown("**🔍 DNS Mapping:** ✅ Succeeded")
+                else:
+                    st.error("🛑 DNS resolution failed. Skipping dependent diagnostics.")
             else:
-                dns_placeholder.error("DNS resolution failed.")
+                ip = "N/A"
 
-            # Submit other diagnostics if DNS was successful
-            if ip != "N/A":
-                future_ping = executor.submit(ping_server, ip)
-                future_traceroute = executor.submit(traceroute_server, ip)
-                future_https = executor.submit(perform_https_request, f"https://{server}")
-            else:
-                ping_placeholder.error("Skipping Ping due to DNS failure.")
-                traceroute_placeholder.error("Skipping Traceroute due to DNS failure.")
-                https_placeholder.error("Skipping HTTPS request due to DNS failure.")
-                # Update diagnosis since other tests are skipped
-                diagnosis = diagnose_issues((ip, dns_info), "", "", {})
-                final_diagnosis_placeholder.markdown(diagnosis)
-                return
+            # Ping Test
+            if run_ping and ip != "N/A":
+                ping_placeholder.markdown("**📡 Ping Test:** Running...")
+                ping_result = ping_server(ip)
+                results["ping_result"] = ping_result
 
-            # As futures complete, update the sidebar
-            for future in concurrent.futures.as_completed([future_ping, future_traceroute, future_https]):
-                if future == future_ping:
-                    ping_result = future.result()
-                    results["ping_result"] = ping_result
-                    if "Request timeout" in ping_result or "unreachable" in ping_result.lower():
-                        ping_placeholder.error("⚠️ Ping test failed.")
-                    else:
-                        ping_placeholder.success("✅ Ping test succeeded.")
-                elif future == future_traceroute:
-                    traceroute_result = future.result()
-                    results["traceroute_result"] = traceroute_result
-                    if "over" in traceroute_result.lower() or "unreachable" in traceroute_result.lower():
-                        traceroute_placeholder.error("⚠️ Traceroute encountered issues.")
-                    else:
-                        traceroute_placeholder.success("✅ Traceroute succeeded.")
-                elif future == future_https:
-                    https_result = future.result()
-                    results["https_result"] = https_result
-                    if 'Error' in https_result:
-                        https_placeholder.error(f"🛑 HTTPS request failed: {https_result['Error']}")
-                    else:
-                        https_placeholder.success("✅ HTTPS request succeeded.")
-                        https_placeholder.markdown(f"**Status Code:** {https_result['Status Code']}")
-                        https_placeholder.markdown("**Response Headers:**")
-                        https_placeholder.json(https_result['Headers'])
-                        https_placeholder.markdown(f"**Body (first 200 characters):** {https_result['Body']}")
-                        https_placeholder.markdown("**Timings:**")
+                if "Request timeout" in ping_result or "unreachable" in ping_result.lower():
+                    ping_placeholder.markdown("**📡 Ping Test:** ⚠️ Failed")
+                    st.warning("⚠️ Ping test failed. The server might be down or ICMP requests are blocked.")
+                else:
+                    ping_placeholder.markdown("**📡 Ping Test:** ✅ Succeeded")
+                    st.success("✅ Ping test succeeded. Server is reachable.")
+            elif run_ping:
+                # Silently ignore skipped Ping Test
+                pass
+
+            # Traceroute
+            if run_traceroute and ip != "N/A":
+                traceroute_placeholder.markdown("**🗺️ Traceroute:** Running...")
+                traceroute_result = traceroute_server(ip)
+                results["traceroute_result"] = traceroute_result
+
+                if "request timed out" in traceroute_result.lower() or "unreachable" in traceroute_result.lower():
+                    traceroute_placeholder.markdown("**🗺️ Traceroute:** ⚠️ Failed")
+                    st.warning("⚠️ Traceroute encountered issues. There might be network routing problems.")
+                else:
+                    traceroute_placeholder.markdown("**🗺️ Traceroute:** ✅ Succeeded")
+                    st.success("✅ Traceroute succeeded. Network routing appears normal.")
+            elif run_traceroute:
+                # Silently ignore skipped Traceroute
+                pass
+
+            # HTTPS GET Request
+            if run_https:
+                https_placeholder.markdown("**🔒 HTTPS GET Request:** Running...")
+                https_result = perform_https_request(url)
+                results["https_result"] = https_result
+
+                if 'Error' in https_result:
+                    https_placeholder.markdown("**🔒 HTTPS GET Request:** 🛑 Failed")
+                    st.error(f"🛑 HTTPS request failed: {https_result['Error']}")
+                else:
+                    https_placeholder.markdown("**🔒 HTTPS GET Request:** ✅ Succeeded")
+                    # Using expander to show detailed HTTPS info
+                    with https_placeholder.expander("📝 View Details"):
+                        st.markdown(f"**Status Code:** {https_result['Status Code']}")
+                        st.markdown(f"**Bytes Downloaded:** {https_result['Bytes Downloaded']} bytes")
+                        st.markdown(f"**Timings:**")
                         for step, duration in https_result['Timings'].items():
-                            https_placeholder.markdown(f"{step}: {duration:.2f} seconds")
-                        https_placeholder.markdown(f"**Total Time:** {https_result['Total Time']:.2f} seconds")
-
+                            st.markdown(f"- **{step}:** {duration:.2f} seconds")
             # Final Diagnosis
             diagnosis = diagnose_issues(
                 results.get("dns_info", ("N/A", {})),
-                results.get("ping_result", ""),
-                results.get("traceroute_result", ""),
-                results.get("https_result", {})
+                results.get("ping_result", "") if run_ping else "",
+                results.get("traceroute_result", "") if run_traceroute else "",
+                results.get("https_result", {}) if run_https else {}
             )
-            final_diagnosis_placeholder.markdown("🩺 **Diagnosis:**")
-            final_diagnosis_placeholder.text(diagnosis)
+            diagnosis_placeholder.markdown("## 🩺 Diagnosis:")
+            st.text(diagnosis)
 
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {str(e)}")
+
+        finally:
+            # Stop diagnostics
+            st.session_state.diagnostics_running = False
+            # Ensure timer stops
+            timer_thread.join()
+
+            # Display Total Time
+            elapsed_total_time = datetime.now() - st.session_state.start_time
+            if elapsed_total_time > timedelta(minutes=3):
+                elapsed_total_time = timedelta(minutes=3)
+            st.session_state.elapsed_time = str(elapsed_total_time).split(".")[0]
+            timer_placeholder.markdown(f"### ⏱️ Total Time: {st.session_state.elapsed_time}")
+
+    # Run the app
 if __name__ == "__main__":
     main()
 
